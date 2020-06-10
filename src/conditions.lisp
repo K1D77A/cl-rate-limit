@@ -32,3 +32,23 @@
             (bucket-is-full-count object)
             (bucket-is-full-attempted object)
             (bucket-is-full-message object))))
+
+(define-condition bucket-q-is-empty (error)
+  ((bucket-q-is-empty-bucket
+    :initarg :bucket-q-is-empty-bucket
+    :accessor bucket-q-is-empty-bucket) 
+   (bucket-q-is-empty-message
+    :initarg :bucket-q-is-empty-message
+    :accessor bucket-q-is-empty-message
+    :documentation "Message indicating what when wrong")))
+
+(defun signal-bucket-q-is-empty (bucket message)
+  (error 'bucket-q-is-empty
+         :bucket-q-is-empty-bucket bucket
+         :bucket-q-is-empty-message message))
+
+(defmethod print-object ((object bucket-q-is-empty) stream)
+  (print-unreadable-object (object stream :type t :identity t)
+    (format stream "~&Bucket queue empty: ~S~%Message: ~A~%"
+            (bucket-q-is-empty-bucket object)
+            (bucket-q-is-empty-message object))))

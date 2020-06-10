@@ -11,4 +11,5 @@ unique id"
   :serial t
   :pathname "src"
   :components ((:file "package")
+               (:file "conditions")
                (:file "cl-rate-limit")))
