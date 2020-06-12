@@ -102,17 +102,17 @@ to store each limiter. This also starts up the thread that unlocks the limiters 
   (zerop (lparallel.vector-queue:vector-queue-count q)))
 
 (defun get-id (limiter)
-  (bt:with-lock-held ((lock limiter))
+  (bt:with-lock-held ((limiter-lock limiter))
     (limiter-id limiter)))
 
 (defun lockedp (limiter)
-  (bt:with-lock-held ((lock limiter))
-    (get-locked limiter)))
+  (bt:with-lock-held ((limiter-lock limiter))
+    (limiter-lockedp limiter)))
 
-(defmethod (setf lockedp) (val (li limiter))
+(defun safe-set-limiter-lockedp (limiter val)
   (check-type val boolean)
-  (bt:with-lock-held ((limiter-lock li))
-    (setf (slot-value li 'lockedp) val)))
+  (bt:with-lock-held ((limiter-lock limiter))
+    (setf (limiter-lockedp limiter) val)))
 
 (defmethod (setf id) (val (li limiter))
   (error "ID shouldn't be modified"))
@@ -123,14 +123,16 @@ to store each limiter. This also starts up the thread that unlocks the limiters 
   (setf (lock-queue-p bucket) nil))
 
 (defun lock-limiter (limiter)
-  (setf (lockedp limiter) t))
+  (safe-set-limiter-lockedp limiter t))
 (defun unlock-limiter (limiter)
-  (setf (lockedp limiter) nil))
+  (safe-set-limiter-lockedp limiter nil))
 
 (defun queue-limiter (id bucket)
   "Given an a string/symbol as an ID and a BUCKET, attempts to create a new limiter and push it into
 the buckets queue, if successful the limiter is returned, if it fails because the buckets queue has
-reached maximum capacity then a condition of type BUCKET-IS-FULL is signalled."
+reached maximum capacity then a condition of type BUCKET-IS-FULL is signalled, or because the 
+queue is currently locked, in the case of the queue being full a condition of type 
+BUCK-Q-IS-LOCKED is signalled"
   ;;(check-type bucket bucket-limit)
   (let ((limiter (make-limiter :id id)))
     (if (vq-full-p (q bucket))
@@ -168,14 +170,12 @@ the TIMEOUT is reached then a condition of type BUCKET-Q-IS-EMPTY is signalled"
 (defun adjust-rate-per-second (bucket new-rate)
   (setf (rate-per-second bucket) new-rate))
 
-(defun unlock-thread (bucket)
+(defun unlock-thread (bucket &optional (timeout 0.1))
   (loop :if (stop-thread-p bucket)
           :do (return :STOPPED-SAFE)
         :else 
-          :do (handler-case (pop-and-unlock bucket)
+          :do (handler-case (pop-and-unlock bucket timeout)
                 (bucket-q-is-empty ()))
-              ;;(format t "mt")
-              ;;(force-output t)))
               (if (purgep bucket)
                   (sleep 0)
                   (sleep (rate-per-second-to-sleep-time (rate-per-second bucket))))))
@@ -189,8 +189,7 @@ the TIMEOUT is reached then a condition of type BUCKET-Q-IS-EMPTY is signalled"
 (defun create-unlock-thread (bucket)
   (bt:make-thread (lambda ()
                     (unlock-thread bucket))))
-;;;need to add a mode where when shutting down the bucket, the queue is locked so that no one can
-;;;add to it again, make a condition like "bucket is shutting down, queue shut"
+
 (defun stop-unlock (bucket)
   "Sets (stop-thread-p BUCKET) to t, in an attempt to get the thread to kill itself. However if the
 thread does not kill itself within 1 second, perhaps it is sleeping or there is nothing on the queue
@@ -204,9 +203,7 @@ so it is blocking then this will destructively kill the thread using EMERGENCY-S
         :else 
           :do (return t)
         :finally (emergency-stop-unlock-thread bucket)))
-;;;maybe ^ wants to add a force option that simply kills the bucket, and a default option that
-;;;stops you from adding to the queue and shuts down the unlocked when the queue has emptied
-;;(defun shutdown-bucket (bucket &optional (clear-queue-first t)))
+
 
 (defun purge-bucket (bucket &optional (unlock t))
   "Given a bucket-limit (BUCKET) this function locks the Q contained within the bucket and PURGEP is 
@@ -224,7 +221,12 @@ rate-per-second slot in the bucket"
           :do (sleep 0.001)))
 
 (defun shutdown-bucket (bucket &key (purge-first nil)(wait-until-empty t)(empty-speed :default))
-  "When passed a bucket-limit (BUCKET) this function attempts to shutdown the bucket"
+  "When passed a bucket-limit (BUCKET) this function attempts to shutdown the bucket. You have three
+options, PURGE-FIRST which will call PURGE-BUCKET on the bucket, draining the bucket as possible.
+WAIT-UNTIL-EMPTY which will lock the bucket and wait until the bucket is empty at the normal rate.
+The final option EMPTY-SPEED is to be used in conjuction with WAIT-UNTIL-EMPTY, by default the 
+arg is :default which makes no adjustment to the speed, but if you wish to adjust the processing rate
+you can provide a new number here which is pops/s"
   (check-type bucket bucket-limit)
   (check-type purge-first boolean)
   (check-type wait-until-empty boolean)
