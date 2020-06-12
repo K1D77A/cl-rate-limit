@@ -51,12 +51,12 @@ limiters")
 (defmethod (setf purgep) (val (bu bucket-limit))
   (check-type val boolean)
   (bt:with-lock-held ((purgep-lock bu))
-    (format t "lock grabbed~%")
+    ;;(format t "lock grabbed~%")
     (setf (slot-value bu '%purge-p) val)))
 
 (defmethod (setf rate-per-second) (val (bu bucket-limit))
   (bt:with-lock-held ((rate-per-second-lock bu))
-    (format t "lock grabbed~%")
+    ;;(format t "lock grabbed~%")
     (setf (slot-value bu '%rate-per-second) val)))
 
 (defmethod (setf stop-thread-p) (val (bu bucket-limit))
@@ -83,7 +83,6 @@ to store each limiter. This also starts up the thread that unlocks the limiters 
     b))
 
 
-(defparameter *limiter* (make-limiter :id "oof2"))
 
 (defun vpop (q &optional (timeout 0.5))
   (check-type q lparallel.vector-queue:vector-queue)
@@ -163,7 +162,6 @@ the TIMEOUT is reached then a condition of type BUCKET-Q-IS-EMPTY is signalled"
         (signal-bucket-q-is-empty bucket "Attempted to pop from BUCKET and timed out"))))
 
 (declaim (inline rate-per-second-to-sleep-time))
-
 (defun rate-per-second-to-sleep-time (rate)
   (/ 1 rate))
 
@@ -174,12 +172,10 @@ the TIMEOUT is reached then a condition of type BUCKET-Q-IS-EMPTY is signalled"
   (loop :if (stop-thread-p bucket)
           :do (return :STOPPED-SAFE)
         :else 
-          :do (handler-case (prog1 (pop-and-unlock bucket)
-                              (format t "popping")
-                              (force-output));;maybe we could make a restart
-                (bucket-q-is-empty ()
-                  (format t "mt")
-                  (force-output t)))
+          :do (handler-case (pop-and-unlock bucket)
+                (bucket-q-is-empty ()))
+              ;;(format t "mt")
+              ;;(force-output t)))
               (if (purgep bucket)
                   (sleep 0)
                   (sleep (rate-per-second-to-sleep-time (rate-per-second bucket))))))
@@ -209,23 +205,49 @@ so it is blocking then this will destructively kill the thread using EMERGENCY-S
           :do (return t)
         :finally (emergency-stop-unlock-thread bucket)))
 ;;;maybe ^ wants to add a force option that simply kills the bucket, and a default option that
-;;;stops you from adding to the queue and shuts down the unlocker when the queue has emptied
+;;;stops you from adding to the queue and shuts down the unlocked when the queue has emptied
 ;;(defun shutdown-bucket (bucket &optional (clear-queue-first t)))
 
-(defun purge-bucket (bucket)
+(defun purge-bucket (bucket &optional (unlock t))
   "Given a bucket-limit (BUCKET) this function locks the Q contained within the bucket and PURGEP is 
 set to T, meaning the unlock thread will process as fast as it can. Once the Q is empty,
-PURGEP is set back to nil and the Q is unlocked once again."
+PURGEP is set back to nil and the Q is unlocked once again. If you set UNLOCK to nil then
+the bucket is kept locked when the function returns. This function makes no modification to the 
+rate-per-second slot in the bucket"
   (lock-bucket bucket)
   (setf (purgep bucket) t)
   (loop :if (vq-empty-p (q bucket))
-          :do (unlock-bucket bucket)
+          :do (when unlock (unlock-bucket bucket))
               (setf (purgep bucket) nil)
               (return t)
         :else
           :do (sleep 0.001)))
-  
-  
+
+(defun shutdown-bucket (bucket &key (purge-first nil)(wait-until-empty t)(empty-speed :default))
+  "When passed a bucket-limit (BUCKET) this function attempts to shutdown the bucket"
+  (check-type bucket bucket-limit)
+  (check-type purge-first boolean)
+  (check-type wait-until-empty boolean)
+  (check-type empty-speed (or keyword number))
+  (let ((current-speed (rate-per-second bucket)))
+    (lock-bucket bucket)
+    (when purge-first
+      (purge-bucket bucket nil)
+      (stop-unlock bucket))
+    (when wait-until-empty
+      (unless (eq empty-speed :default)
+        (adjust-rate-per-second bucket empty-speed))
+      (loop :if (vq-empty-p (q bucket))
+              :do (stop-unlock bucket)
+                  (return t)
+            :else
+              :do (sleep 0.01)))
+    (and (not purge-first)
+         (not wait-until-empty)
+         (stop-unlock bucket))
+    (adjust-rate-per-second bucket current-speed)
+    :shutdown))
+
 (defun make-full-bucket (rps length)
   (let ((b (make-bucket rps length)))
     ;;(unwind-protect
