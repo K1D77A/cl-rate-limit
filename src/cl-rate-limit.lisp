@@ -26,45 +26,33 @@
     :type bt:lock
     :documentation "is grabbed to then stop the thread safely")))
 
+(defstruct limiter
+  (lock (bt:make-lock))
+  id 
+  (lockedp t))
+
 (defun make-bucket (rate-per-second &optional (max-len 10000))
   "Creates an instance of the class bucket-limit where max-len is the length of the vector-queue used
 to store each limiter. This also starts up the thread that unlocks the limiters put on the queue"
   (let ((b (make-instance 'bucket-limit :rate-per-second rate-per-second
                                         :q (lparallel.vector-queue:make-vector-queue max-len))))
-    (setf (unlocking-thread b) (create-unlock-thread rate-per-second b))
+    (setf (unlocking-thread b) (create-unlock-thread b))
     b))
 
-(defun make-limiter (id)
-  (list (list :lock (bt:make-lock))(list :id id)(list :lockedp t)))
 
-(defparameter *limiter* (make-limiter "oof2"))
+(defparameter *limiter* (make-limiter :id "oof2"))
 
 (defmacro access-limiter (limiter &body body)
-  `(let ((lock (cadr (assoc :lock ,limiter :test #'eq))))
+  `(let ((lock (limiter-lock ,limiter)))
      (unwind-protect
           (prog2 (bt:acquire-lock lock)
               ,@body
             (bt:release-lock lock))
        (bt:release-lock lock))))
 
-(defun limiterp (list)
-  "Takes in a list and checks whether it is a limiter"
-  (when (= 3 (length list))
-    (destructuring-bind (fi se th)
-        list
-      (and (eq (car fi) :lock)
-           (not (null (cadr fi)))
-           (eq (car se) :id)
-           (not (null (cadr se)))
-           (eq (car th) :lockedp)
-           (or (eq (cadr th) nil)
-               (eq (cadr th) t))))))
-
-(deftype limiter () `(satisfies limiterp))
-
 (defun vpop (q &optional (timeout 0.5))
   (check-type q lparallel.vector-queue:vector-queue)
-  (check-type timeout (float 0 *))
+  (check-type timeout number)
   (lparallel.vector-queue:try-pop-vector-queue q timeout))
 
 (defun vpush (ele q)
@@ -75,35 +63,37 @@ to store each limiter. This also starts up the thread that unlocks the limiters 
   (check-type q lparallel.vector-queue:vector-queue)
   (lparallel.vector-queue:vector-queue-full-p q))
 
-(defun lassoc (limiter key)
-  (access-limiter limiter
-    (assoc key limiter :test #'eq)))
+(defmacro limiter-safe-access (limiter &body body) 
+  `(access-limiter ,limiter
+     ,@body))
 
 (defun get-id (limiter)
-  (check-type limiter limiter)
-  (cadr (lassoc limiter :id)))
-
+  (limiter-safe-access limiter
+    (limiter-id limiter)))
 (defun get-locked (limiter)
-  (check-type limiter limiter)
-  (cadr (lassoc limiter :lockedp)))
+  (limiter-safe-access limiter
+    (limiter-lockedp limiter)))
 
 (defun lockedp (limiter)
   (get-locked limiter))
 
+(defun change-lock (limiter val)
+  (check-type val boolean)
+  (limiter-safe-access limiter 
+    (setf (limiter-lockedp limiter) val)))
+
 (defun lock (limiter)
-  (check-type limiter limiter)
-  (rplacd (lassoc limiter :lockedp) (list t)))
+  (change-lock limiter t))
 
 (defun unlock (limiter)
-  (check-type limiter limiter)
-  (rplacd (lassoc limiter :lockedp) (list nil)))
+  (change-lock limiter nil))
 
 (defun queue-limiter (id bucket)
   "Given an a string/symbol as an ID and a BUCKET, attempts to create a new limiter and push it into
 the buckets queue, if successful the limiter is returned, if it fails because the buckets queue has
 reached maximum capacity then a condition of type BUCKET-IS-FULL is signalled."
   ;;(check-type bucket bucket-limit)
-  (let ((limiter (make-limiter id)))
+  (let ((limiter (make-limiter :id id)))
     (if (vq-full-p (q bucket))
         (signal-bucket-is-full bucket (lparallel.vector-queue:vector-queue-count (q bucket))
                                limiter "Failed to add new limiter to bucket")
@@ -126,7 +116,7 @@ reached maximum capacity then a condition of type BUCKET-IS-FULL is signalled."
 the TIMEOUT is reached then a condition of type BUCKET-Q-IS-EMPTY is signalled"
   (check-type bucket bucket-limit)
   (let ((popped (vpop (q bucket) timeout)))
-    (if (limiterp popped)
+    (if (eq (type-of popped) 'limiter)
         (unlock popped)
         (signal-bucket-q-is-empty bucket "Attempted to pop from BUCKET and timed out"))))
 
@@ -152,9 +142,9 @@ the TIMEOUT is reached then a condition of type BUCKET-Q-IS-EMPTY is signalled"
       (bt:destroy-thread (unlocking-thread bucket))
       t))
 
-(defun create-unlock-thread (rate-per-second bucket)
+(defun create-unlock-thread (bucket)
   (bt:make-thread (lambda ()
-                    (unlock-thread rate-per-second bucket))))
+                    (unlock-thread bucket))))
 
 (defun stop-unlock (bucket)
   "Sets (stop-thread-p BUCKET) to t, in an attempt to get the thread to kill itself. However if the
