@@ -52,3 +52,23 @@
     (format stream "~&Bucket queue empty: ~S~%Message: ~A~%"
             (bucket-q-is-empty-bucket object)
             (bucket-q-is-empty-message object))))
+
+(define-condition bucket-q-is-locked (error)
+  ((bucket-q-is-locked-bucket
+    :initarg :bucket-q-is-locked-bucket
+    :accessor bucket-q-is-locked-bucket) 
+   (bucket-q-is-empty-message
+    :initarg :bucket-q-is-locked-message
+    :accessor bucket-q-is-locked-message
+    :documentation "Message indicating what when wrong")))
+
+(defun signal-bucket-q-is-locked (bucket message)
+  (error 'bucket-q-is-locked
+         :bucket-q-is-locked-bucket bucket
+         :bucket-q-is-locked-message message))
+
+(defmethod print-object ((object bucket-q-is-locked) stream)
+  (print-unreadable-object (object stream :type t :identity t)
+    (format stream "~&Bucket queue locked: ~S~%Message: ~A~%"
+            (bucket-q-is-locked-bucket object)
+            (bucket-q-is-locked-message object))))

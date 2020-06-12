@@ -5,50 +5,85 @@
 (defparameter *rate-limit-table* (make-hash-table :test #'equal))
 
 (defclass bucket-limit ()
-  ((q
+  ((%q
     :initarg :q
     :accessor q
     :type lparallel.vector-queue:vector-queue)
-   (unlocking-thread
+   (%q-capacity
+    :initarg :q-capacity
+    :reader q-capacity
+    :type number)
+   (%lock-queue-p
+    :accessor lock-queue-p
+    :initform nil)
+   (%queue-lock-p-lock
+    :reader queue-lock-p-lock
+    :initform (bt:make-lock))
+   (%unlocking-thread
     :initarg :unlocking-thread
     :accessor unlocking-thread)
-   (stop-thread-p
+   (%purge-p
+    :accessor purgep
+    :initform nil
+    :documentation "Setting this flag to T causes the bucket to lock its queue and unlock all
+limiters")
+   (%purge-p-lock
+    :reader purgep-lock
+    :initform (bt:make-lock))
+   (%stop-thread-p
     :initform nil
     :accessor stop-thread-p
     :type boolean)
-   (rate-per-second
+   (%stop-thread-lock
+    :initform (bt:make-lock)
+    :reader stop-thread-lock
+    :type bt:lock
+    :documentation "is grabbed to then stop the thread safely")
+   (%rate-per-second
     :initarg :rate-per-second
     :accessor rate-per-second
     :type number)
-   (stop-thread-lock
-    :initform (bt:make-lock)
-    :accessor stop-thread-lock
-    :type bt:lock
-    :documentation "is grabbed to then stop the thread safely")))
+   (%rate-per-second-lock
+    :reader rate-per-second-lock
+    :initform (bt:make-lock))
+   ))
+
+(defmethod (setf purgep) (val (bu bucket-limit))
+  (check-type val boolean)
+  (bt:with-lock-held ((purgep-lock bu))
+    (format t "lock grabbed~%")
+    (setf (slot-value bu '%purge-p) val)))
+
+(defmethod (setf rate-per-second) (val (bu bucket-limit))
+  (bt:with-lock-held ((rate-per-second-lock bu))
+    (format t "lock grabbed~%")
+    (setf (slot-value bu '%rate-per-second) val)))
+
+(defmethod (setf stop-thread-p) (val (bu bucket-limit))
+  (bt:with-lock-held ((stop-thread-lock bu))
+    (setf (slot-value bu '%stop-thread-p) val)))
+
+(defmethod (setf lock-queue-p) (val (bu bucket-limit))
+  (check-type val boolean)
+  (bt:with-lock-held ((queue-lock-p-lock bu))
+    (setf (slot-value bu '%lock-queue-p) val)))
 
 (defstruct limiter
   (lock (bt:make-lock))
-  id 
+  id
   (lockedp t))
 
 (defun make-bucket (rate-per-second &optional (max-len 10000))
   "Creates an instance of the class bucket-limit where max-len is the length of the vector-queue used
 to store each limiter. This also starts up the thread that unlocks the limiters put on the queue"
   (let ((b (make-instance 'bucket-limit :rate-per-second rate-per-second
-                                        :q (lparallel.vector-queue:make-vector-queue max-len))))
+                                        :q (lparallel.vector-queue:make-vector-queue max-len)
+                                        :q-capacity max-len)))
     (setf (unlocking-thread b) (create-unlock-thread b))
     b))
 
 
 (defparameter *limiter* (make-limiter :id "oof2"))
-
-(defmacro access-limiter (limiter &body body)
-  `(let ((lock (limiter-lock ,limiter)))
-     (unwind-protect
-          (prog2 (bt:acquire-lock lock)
-              ,@body
-            (bt:release-lock lock))
-       (bt:release-lock lock))))
 
 (defun vpop (q &optional (timeout 0.5))
   (check-type q lparallel.vector-queue:vector-queue)
@@ -63,30 +98,35 @@ to store each limiter. This also starts up the thread that unlocks the limiters 
   (check-type q lparallel.vector-queue:vector-queue)
   (lparallel.vector-queue:vector-queue-full-p q))
 
-(defmacro limiter-safe-access (limiter &body body) 
-  `(access-limiter ,limiter
-     ,@body))
+(defun vq-empty-p (q)
+  (check-type q lparallel.vector-queue:vector-queue)
+  (zerop (lparallel.vector-queue:vector-queue-count q)))
 
 (defun get-id (limiter)
-  (limiter-safe-access limiter
+  (bt:with-lock-held ((lock limiter))
     (limiter-id limiter)))
-(defun get-locked (limiter)
-  (limiter-safe-access limiter
-    (limiter-lockedp limiter)))
 
 (defun lockedp (limiter)
-  (get-locked limiter))
+  (bt:with-lock-held ((lock limiter))
+    (get-locked limiter)))
 
-(defun change-lock (limiter val)
+(defmethod (setf lockedp) (val (li limiter))
   (check-type val boolean)
-  (limiter-safe-access limiter 
-    (setf (limiter-lockedp limiter) val)))
+  (bt:with-lock-held ((limiter-lock li))
+    (setf (slot-value li 'lockedp) val)))
 
-(defun lock (limiter)
-  (change-lock limiter t))
+(defmethod (setf id) (val (li limiter))
+  (error "ID shouldn't be modified"))
 
-(defun unlock (limiter)
-  (change-lock limiter nil))
+(defun lock-bucket (bucket)
+  (setf (lock-queue-p bucket) t))
+(defun unlock-bucket (bucket)
+  (setf (lock-queue-p bucket) nil))
+
+(defun lock-limiter (limiter)
+  (setf (lockedp limiter) t))
+(defun unlock-limiter (limiter)
+  (setf (lockedp limiter) nil))
 
 (defun queue-limiter (id bucket)
   "Given an a string/symbol as an ID and a BUCKET, attempts to create a new limiter and push it into
@@ -98,7 +138,9 @@ reached maximum capacity then a condition of type BUCKET-IS-FULL is signalled."
         (signal-bucket-is-full bucket (lparallel.vector-queue:vector-queue-count (q bucket))
                                limiter "Failed to add new limiter to bucket")
         ;;this can be handled higher up by say returning a 429 or something
-        (vpush limiter (q bucket)))
+        (if (lock-queue-p bucket)
+            (signal-bucket-q-is-locked bucket "The bucket Q is locked. Perhaps it is shutting down?")
+            (vpush limiter (q bucket))))
     limiter))
 
 (defun execute-func-when-limiter-free (limiter func)
@@ -117,24 +159,30 @@ the TIMEOUT is reached then a condition of type BUCKET-Q-IS-EMPTY is signalled"
   (check-type bucket bucket-limit)
   (let ((popped (vpop (q bucket) timeout)))
     (if (eq (type-of popped) 'limiter)
-        (unlock popped)
+        (unlock-limiter popped)
         (signal-bucket-q-is-empty bucket "Attempted to pop from BUCKET and timed out"))))
 
 (declaim (inline rate-per-second-to-sleep-time))
+
 (defun rate-per-second-to-sleep-time (rate)
   (/ 1 rate))
+
+(defun adjust-rate-per-second (bucket new-rate)
+  (setf (rate-per-second bucket) new-rate))
 
 (defun unlock-thread (bucket)
   (loop :if (stop-thread-p bucket)
           :do (return :STOPPED-SAFE)
         :else 
           :do (handler-case (prog1 (pop-and-unlock bucket)
-                              (format t "popping~%")
+                              (format t "popping")
                               (force-output));;maybe we could make a restart
                 (bucket-q-is-empty ()
                   (format t "mt")
                   (force-output t)))
-              (sleep (rate-per-second-to-sleep-time (rate-per-second bucket)))))
+              (if (purgep bucket)
+                  (sleep 0)
+                  (sleep (rate-per-second-to-sleep-time (rate-per-second bucket))))))
 
 (defun emergency-stop-unlock-thread (bucket)
   "Destructively kills the thread used to unlock limiters. Only for use in the worst case."
@@ -145,13 +193,13 @@ the TIMEOUT is reached then a condition of type BUCKET-Q-IS-EMPTY is signalled"
 (defun create-unlock-thread (bucket)
   (bt:make-thread (lambda ()
                     (unlock-thread bucket))))
-
+;;;need to add a mode where when shutting down the bucket, the queue is locked so that no one can
+;;;add to it again, make a condition like "bucket is shutting down, queue shut"
 (defun stop-unlock (bucket)
   "Sets (stop-thread-p BUCKET) to t, in an attempt to get the thread to kill itself. However if the
 thread does not kill itself within 1 second, perhaps it is sleeping or there is nothing on the queue
 so it is blocking then this will destructively kill the thread using EMERGENCY-STOP-UNLOCK-THREAD"
-  (bt:with-lock-held ((stop-thread-lock bucket))
-    (setf (stop-thread-p bucket) t))
+  (setf (stop-thread-p bucket) t)
   (loop :for n :from 1 :upto 1000
         :for alivep := (bt:thread-alive-p (unlocking-thread bucket))
           :then (bt:thread-alive-p (unlocking-thread bucket))
@@ -162,12 +210,31 @@ so it is blocking then this will destructively kill the thread using EMERGENCY-S
         :finally (emergency-stop-unlock-thread bucket)))
 ;;;maybe ^ wants to add a force option that simply kills the bucket, and a default option that
 ;;;stops you from adding to the queue and shuts down the unlocker when the queue has emptied
-(defun test-limiter ()
-  (let ((limiter (make-limiter :test)))
-    (bt:make-thread (lambda () (execute-func-when-limiter-free limiter (lambda ()
-                                                                    (format t "executed")
-                                                                    (force-output t)))))
-    (sleep 5)
-    (unlock limiter)))
+;;(defun shutdown-bucket (bucket &optional (clear-queue-first t)))
 
+(defun purge-bucket (bucket)
+  "Given a bucket-limit (BUCKET) this function locks the Q contained within the bucket and PURGEP is 
+set to T, meaning the unlock thread will process as fast as it can. Once the Q is empty,
+PURGEP is set back to nil and the Q is unlocked once again."
+  (lock-bucket bucket)
+  (setf (purgep bucket) t)
+  (loop :if (vq-empty-p (q bucket))
+          :do (unlock-bucket bucket)
+              (setf (purgep bucket) nil)
+              (return t)
+        :else
+          :do (sleep 0.001)))
+  
+  
+(defun make-full-bucket (rps length)
+  (let ((b (make-bucket rps length)))
+    ;;(unwind-protect
+    (dotimes (i length b)
+      (queue-limiter (gensym) b))))
+;;    (stop-unlock b))))
 
+(defun fill-bucket-from-mt (bucket)
+  (dotimes (i (q-capacity bucket))
+    (sleep 0.1)
+    (queue-limiter (gensym) bucket)))
+  
