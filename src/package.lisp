@@ -10,4 +10,11 @@
            #:adjust-rate-per-second
            #:bucket-execute
            #:execute-func-when-limiter-free
+           #:bucket-is-full
+           #:bucket-is-full-bucket
+           #:bucket-is-full-count
+           #:bucket-is-full-attempted
+           #:bucket-is-full-message
+           #:bucket-q-is-locked-bucket
+           #:bucket-q-is-locked-message
            ))
