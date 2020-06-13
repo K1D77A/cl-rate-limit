@@ -18,4 +18,5 @@
            #:bucket-q-is-locked
            #:bucket-q-is-locked-bucket
            #:bucket-q-is-locked-message
+           #:queue-limiter
            ))
