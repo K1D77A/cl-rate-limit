@@ -8,7 +8,7 @@
            #:stop-unlock
            #:emergency-stop-unlock-thread
            #:adjust-rate-per-second
-           #:bucket-execute
+           #:bucket-execution
            #:execute-func-when-limiter-free
            #:bucket-is-full
            #:bucket-is-full-bucket
